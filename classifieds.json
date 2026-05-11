@@ -1,4 +1,6 @@
 {
+  "meetupNpub": "npub1ynn5qnnc95qaqjejrtyazfdgutlxvme3djywe6s9wg76k68s37sqsl2qfd",
+  "relayTemplateNpub": "npub1xgyjasdztryl9sg6nfdm2wcj0j3qjs03sq7a0an32pg0lr5l6yaqxhgu7s",
   "relays": [
     "wss://relay.damus.io",
     "wss://nos.lol",
@@ -11,6 +13,17 @@
   "blossom": {
     "server": "https://blossom.primal.net"
   },
+  "fallbackRelays": [
+    "wss://relay.primal.net",
+    "wss://relay.damus.io",
+    "wss://purplepag.es",
+    "wss://relay.plebeian.market"
+  ],
+  "fallbackDMRelays": [
+    "wss://relay.0xchat.com",
+    "wss://relay.primal.net",
+    "wss://nos.lol"
+  ],
   "whitelistedNpubs": [
     "npub1xgyjasdztryl9sg6nfdm2wcj0j3qjs03sq7a0an32pg0lr5l6yaqxhgu7s"
   ]

@@ -225,17 +225,133 @@
   </div>
 
   <!-- ============================================================
-       SIGN UP / ONBOARDING MODAL (stub — flow TBD)
+       SIGN UP / ONBOARDING WIZARD
        ============================================================ -->
   <div class="modal-overlay" id="signup-modal" role="dialog" aria-modal="true" aria-labelledby="signup-modal-title">
-    <div class="modal modal-sm">
+    <div class="modal">
       <button class="modal-close" aria-label="Close" data-close>×</button>
+
       <div class="modal-header">
-        <h3 id="signup-modal-title">Sign up</h3>
+        <h3 id="signup-modal-title">Welcome to Nostr</h3>
+        <div class="wizard-steps" id="wizard-steps">
+          <div class="wizard-step active" data-step="1"><span class="wizard-step-num">1</span> Save your key</div>
+          <div class="wizard-step" data-step="2"><span class="wizard-step-num">2</span> Profile</div>
+          <div class="wizard-step" data-step="3"><span class="wizard-step-num">3</span> Done</div>
+        </div>
       </div>
+
       <div class="modal-body">
-        <p style="margin-bottom: 16px;">Welcome 👋 — we're still designing this flow. Tell Reed what you'd like to see here.</p>
-        <p style="font-size: 0.85rem; color: var(--text-dim);">In the meantime, you can create a Nostr key at <a href="https://nstart.me" target="_blank" rel="noopener" style="color: var(--orange);">nstart.me</a> or <a href="https://nsec.app" target="_blank" rel="noopener" style="color: var(--orange);">nsec.app</a>, then come back and use one of the sign-in options.</p>
+
+        <!-- ===== Step 1: Save your key ===== -->
+        <div class="wizard-pane active" data-pane="1">
+          <p>You're about to create a new Nostr account. We'll generate a private key for you in this browser — <strong>you'll need to save it.</strong> Without it, you can't get back into your account.</p>
+
+          <div class="wizard-keygen" id="wizard-keygen-pre">
+            <button class="btn btn-orange" id="wizard-generate-btn" style="margin-top: 16px;">Generate my key</button>
+          </div>
+
+          <div class="wizard-keygen" id="wizard-keygen-post" style="display: none;">
+            <div class="wizard-key-block">
+              <label>Your public key (npub) — share this freely</label>
+              <div class="wizard-key-row">
+                <code id="wizard-npub"></code>
+                <button type="button" class="wizard-key-copy" data-copy="npub">Copy</button>
+              </div>
+            </div>
+
+            <div class="wizard-key-block wizard-key-block-secret">
+              <label>Your secret key (nsec) — <strong>keep this private</strong></label>
+              <div class="wizard-key-row">
+                <code id="wizard-nsec"></code>
+                <button type="button" class="wizard-key-copy" data-copy="nsec">Copy</button>
+              </div>
+              <p class="wizard-key-warning">Anyone with this key controls your account. We're not saving it anywhere — it lives only in this browser tab. <strong>Download it now</strong> or copy it to a password manager.</p>
+              <div class="wizard-key-actions">
+                <button type="button" class="btn btn-orange" id="wizard-download-btn">⬇ Download backup .txt</button>
+              </div>
+            </div>
+
+            <label class="wizard-confirm">
+              <input type="checkbox" id="wizard-saved-checkbox">
+              <span>I've saved my key. I understand that if I lose it, my account is gone forever.</span>
+            </label>
+
+            <div class="wizard-actions">
+              <button type="button" class="btn btn-orange" id="wizard-step1-next" disabled>Continue →</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== Step 2: Profile ===== -->
+        <div class="wizard-pane" data-pane="2">
+          <p style="margin-bottom: 20px;">Fill in your profile. Only your name is required — everything else can be edited later from any Nostr client.</p>
+
+          <div class="wizard-banner-wrap">
+            <label class="wizard-banner" id="wizard-banner-pick">
+              <input type="file" id="wizard-banner-input" accept="image/*" style="display:none">
+              <span class="wizard-banner-placeholder">+ Add a banner image (optional)</span>
+            </label>
+            <label class="wizard-pfp" id="wizard-pfp-pick">
+              <input type="file" id="wizard-pfp-input" accept="image/*" style="display:none">
+              <span class="wizard-pfp-placeholder">+ pfp</span>
+            </label>
+          </div>
+
+          <div class="composer-field">
+            <label for="wizard-name">Name *</label>
+            <input type="text" id="wizard-name" maxlength="50" placeholder="e.g. alice" required>
+            <p class="composer-hint">Short, lowercase handle. No spaces.</p>
+          </div>
+
+          <div class="composer-field">
+            <label for="wizard-display-name">Display name</label>
+            <input type="text" id="wizard-display-name" maxlength="50" placeholder="e.g. Alice Satoshi">
+          </div>
+
+          <div class="composer-field">
+            <label for="wizard-about">Bio</label>
+            <textarea id="wizard-about" maxlength="400" placeholder="A sentence or two about you" style="min-height: 80px;"></textarea>
+          </div>
+
+          <div class="composer-field">
+            <label for="wizard-lud16">Lightning address</label>
+            <input type="text" id="wizard-lud16" placeholder="alice@walletofsatoshi.com">
+          </div>
+
+          <div class="composer-field">
+            <label for="wizard-website">Website</label>
+            <input type="url" id="wizard-website" placeholder="https://...">
+          </div>
+
+          <div class="wizard-actions">
+            <button type="button" class="btn btn-ghost" id="wizard-step2-back">← Back</button>
+            <button type="button" class="btn btn-orange" id="wizard-step2-next">Finish setup →</button>
+          </div>
+        </div>
+
+        <!-- ===== Step 3: Publishing ===== -->
+        <div class="wizard-pane" data-pane="3">
+          <p style="margin-bottom: 16px;">Setting everything up. This takes a few seconds.</p>
+
+          <ul class="wizard-progress" id="wizard-progress">
+            <li data-task="profile"><span class="wizard-progress-icon">○</span> Publishing your profile</li>
+            <li data-task="relays"><span class="wizard-progress-icon">○</span> Setting your read/write relays</li>
+            <li data-task="dmrelays"><span class="wizard-progress-icon">○</span> Setting your DM relays</li>
+            <li data-task="contacts"><span class="wizard-progress-icon">○</span> Following the meetup community</li>
+          </ul>
+
+          <div class="wizard-final" id="wizard-final" style="display:none;">
+            <h4 style="margin-bottom: 8px;">🎉 You're all set</h4>
+            <p>You're signed in. Your account is live on Nostr — go check out other Nostr clients like <a href="https://primal.net" target="_blank" rel="noopener" style="color: var(--orange);">Primal</a> or <a href="https://damus.io" target="_blank" rel="noopener" style="color: var(--orange);">Damus</a> to see it.</p>
+            <p style="margin-top: 12px;">To start posting listings on this page, an organizer needs to approve you. You auto-followed the meetup npub — that's their cue to follow you back, which adds you to the seller list. Until then, anything you post will live on Nostr but won't show on this page yet.</p>
+            <div class="wizard-actions" style="margin-top: 20px; justify-content: flex-end;">
+              <button type="button" class="btn btn-orange" id="wizard-finish-btn">Got it</button>
+            </div>
+          </div>
+
+          <div class="wizard-error" id="wizard-error" style="display:none;"></div>
+        </div>
+
       </div>
     </div>
   </div>

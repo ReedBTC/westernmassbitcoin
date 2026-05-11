@@ -20,11 +20,13 @@ import { BunkerSigner, parseBunkerInput } from 'https://esm.sh/nostr-tools@2.7.2
 // Config + state
 // ============================================================
 let config = null;
-let whitelistHex = []; // hex pubkeys
+let whitelistHex = [];        // hex pubkeys allowed to publish listings shown here
+let meetupHex = null;         // hex pubkey of the meetup npub (source of kind 3 whitelist)
+let relayTemplateHex = null;  // hex pubkey we copy kind 10002 + 10050 from for new users
 let pool = null;
-const listings = new Map(); // d-tag-key -> latest event
-const profiles = new Map(); // hex pubkey -> kind 0 metadata
-let activeSigner = null;    // { pubkey, signEvent, kind, close? }
+const listings = new Map();   // d-tag-key -> latest event
+const profiles = new Map();   // hex pubkey -> kind 0 metadata
+let activeSigner = null;      // { pubkey, signEvent, kind, close? }
 
 // ============================================================
 // Boot
@@ -38,22 +40,71 @@ let activeSigner = null;    // { pubkey, signEvent, kind, close? }
     return;
   }
 
-  whitelistHex = config.whitelistedNpubs
-    .map(npub => {
-      try { return nip19.decode(npub).data; } catch { return null; }
-    })
-    .filter(Boolean);
-
-  if (!whitelistHex.length) {
-    showError('No whitelisted sellers configured yet.');
-    return;
-  }
+  try {
+    if (config.meetupNpub) meetupHex = nip19.decode(config.meetupNpub).data;
+  } catch {}
+  try {
+    if (config.relayTemplateNpub) relayTemplateHex = nip19.decode(config.relayTemplateNpub).data;
+  } catch {}
 
   pool = new SimplePool();
 
   wireUI();
+  await loadWhitelist();
   loadListings();
 })();
+
+// ============================================================
+// Whitelist: derived from meetup npub's kind 3 contact list
+// ============================================================
+async function loadWhitelist() {
+  // Try dynamic (kind 3 from meetup npub)
+  if (meetupHex) {
+    try {
+      const followed = await fetchMeetupContacts();
+      if (followed.length) {
+        whitelistHex = followed;
+        return;
+      }
+    } catch (err) {
+      console.warn('Meetup contact list fetch failed; falling back to static whitelist.', err);
+    }
+  }
+
+  // Fallback: static list in classifieds.json
+  whitelistHex = (config.whitelistedNpubs || [])
+    .map(n => { try { return nip19.decode(n).data; } catch { return null; } })
+    .filter(Boolean);
+}
+
+function fetchMeetupContacts() {
+  return new Promise((resolve) => {
+    let latest = null;
+    const sub = pool.subscribeMany(
+      config.relays,
+      [{ kinds: [3], authors: [meetupHex], limit: 1 }],
+      {
+        onevent(event) {
+          if (!latest || event.created_at > latest.created_at) latest = event;
+        },
+        oneose() {
+          sub.close();
+          const pubkeys = latest
+            ? latest.tags.filter(t => t[0] === 'p' && /^[0-9a-f]{64}$/.test(t[1] || '')).map(t => t[1])
+            : [];
+          resolve(pubkeys);
+        }
+      }
+    );
+    setTimeout(() => {
+      sub.close();
+      const pubkeys = latest
+        ? latest.tags.filter(t => t[0] === 'p' && /^[0-9a-f]{64}$/.test(t[1] || '')).map(t => t[1])
+        : [];
+      resolve(pubkeys);
+    }, 5000);
+  });
+}
 
 // ============================================================
 // UI wiring
@@ -86,6 +137,9 @@ function wireUI() {
   });
   document.getElementById('composer-file-input').addEventListener('change', handleImagePick);
 
+  // Signup wizard
+  wireSignupWizard();
+
   // Help tips (click to toggle on mobile, hover/focus already handled by CSS)
   document.querySelectorAll('.help-tip').forEach(tip => {
     tip.addEventListener('click', (e) => {
@@ -113,6 +167,17 @@ function wireUI() {
 // ============================================================
 function loadListings() {
   const grid = document.getElementById('cf-grid');
+
+  if (!whitelistHex.length) {
+    grid.innerHTML = '';
+    const empty = document.createElement('div');
+    empty.className = 'listing-empty';
+    empty.textContent = 'No approved sellers yet — an organizer is curating the list. Sign up below and you might be next.';
+    grid.appendChild(empty);
+    setStatus('Waiting for the meetup to approve sellers…');
+    return;
+  }
+
   grid.innerHTML = '<div class="listing-loading">Connecting to relays…</div>';
 
   let eventCount = 0;
@@ -715,41 +780,9 @@ async function uploadImage(file) {
   container.insertBefore(wrap, addBtn);
 
   try {
-    const buf = await file.arrayBuffer();
-    const hashBuf = await crypto.subtle.digest('SHA-256', buf);
-    const sha256 = [...new Uint8Array(hashBuf)].map(b => b.toString(16).padStart(2, '0')).join('');
-
-    const authEvent = await activeSigner.signEvent({
-      kind: 24242,
-      created_at: Math.floor(Date.now() / 1000),
-      content: 'Upload from westernmassbitcoin.com classifieds',
-      tags: [
-        ['t', 'upload'],
-        ['x', sha256],
-        ['expiration', String(Math.floor(Date.now() / 1000) + 600)],
-        ['client', 'westernmassbitcoin'],
-      ],
-    });
-
-    const authHeader = 'Nostr ' + btoa(JSON.stringify(authEvent));
-
-    const res = await fetch(`${config.blossom.server}/upload`, {
-      method: 'PUT',
-      headers: {
-        'Authorization': authHeader,
-        'Content-Type': file.type || 'application/octet-stream',
-      },
-      body: buf,
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Blossom upload failed (${res.status}): ${text.slice(0, 120)}`);
-    }
-
-    const body = await res.json();
-    slot.url = body.url;
-    slot.sha256 = body.sha256 || sha256;
+    const { url, sha256 } = await uploadToBlossom(file, activeSigner);
+    slot.url = url;
+    slot.sha256 = sha256;
     slot.pending = false;
     prog.remove();
   } catch (err) {
@@ -861,4 +894,423 @@ function composerStatus(msg, kind) {
   const el = document.getElementById('composer-status');
   el.className = 'composer-status' + (msg ? ' show ' + (kind || '') : '');
   el.textContent = msg;
+}
+
+// ============================================================
+// Blossom upload helper (used by composer + signup wizard)
+// ============================================================
+async function uploadToBlossom(file, signer) {
+  if (!file.type.startsWith('image/')) throw new Error('Not an image.');
+  if (file.size > 8 * 1024 * 1024) throw new Error('Image too large (max 8MB).');
+  if (!signer) throw new Error('Not signed in.');
+
+  const buf = await file.arrayBuffer();
+  const hashBuf = await crypto.subtle.digest('SHA-256', buf);
+  const sha256 = [...new Uint8Array(hashBuf)].map(b => b.toString(16).padStart(2, '0')).join('');
+
+  const authEvent = await signer.signEvent({
+    kind: 24242,
+    created_at: Math.floor(Date.now() / 1000),
+    content: 'Upload from westernmassbitcoin.com classifieds',
+    tags: [
+      ['t', 'upload'],
+      ['x', sha256],
+      ['expiration', String(Math.floor(Date.now() / 1000) + 600)],
+      ['client', 'westernmassbitcoin'],
+    ],
+  });
+
+  const authHeader = 'Nostr ' + btoa(JSON.stringify(authEvent));
+
+  const res = await fetch(`${config.blossom.server}/upload`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': authHeader,
+      'Content-Type': file.type || 'application/octet-stream',
+    },
+    body: buf,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Blossom ${res.status}: ${text.slice(0, 120)}`);
+  }
+
+  const body = await res.json();
+  return { url: body.url, sha256: body.sha256 || sha256 };
+}
+
+// ============================================================
+// Signup wizard
+// ============================================================
+let signupState = null;
+
+function wireSignupWizard() {
+  document.getElementById('wizard-generate-btn').addEventListener('click', wizardGenerate);
+
+  document.querySelectorAll('.wizard-key-copy').forEach(btn => {
+    btn.addEventListener('click', () => wizardCopy(btn));
+  });
+
+  document.getElementById('wizard-download-btn').addEventListener('click', wizardDownload);
+
+  document.getElementById('wizard-saved-checkbox').addEventListener('change', (e) => {
+    document.getElementById('wizard-step1-next').disabled = !e.target.checked;
+  });
+
+  document.getElementById('wizard-step1-next').addEventListener('click', () => wizardGoToStep(2));
+  document.getElementById('wizard-step2-back').addEventListener('click', () => wizardGoToStep(1));
+  document.getElementById('wizard-step2-next').addEventListener('click', wizardStep2Submit);
+  document.getElementById('wizard-finish-btn').addEventListener('click', wizardFinish);
+
+  document.getElementById('wizard-pfp-input').addEventListener('change', (e) => wizardUploadProfileImage(e, 'pfp'));
+  document.getElementById('wizard-banner-input').addEventListener('change', (e) => wizardUploadProfileImage(e, 'banner'));
+}
+
+function wizardGenerate() {
+  const secretKey = generateSecretKey();           // Uint8Array
+  const pubkey = getPublicKey(secretKey);          // hex
+  const nsec = nip19.nsecEncode(secretKey);
+  const npub = nip19.npubEncode(pubkey);
+
+  signupState = {
+    secretKey,
+    pubkey,
+    nsec,
+    npub,
+    pfpUrl: null,
+    bannerUrl: null,
+    signEvent: async (event) => finalizeEvent(event, secretKey),
+  };
+
+  document.getElementById('wizard-npub').textContent = npub;
+  document.getElementById('wizard-nsec').textContent = nsec;
+  document.getElementById('wizard-keygen-pre').style.display = 'none';
+  document.getElementById('wizard-keygen-post').style.display = '';
+}
+
+function wizardCopy(btn) {
+  if (!signupState) return;
+  const what = btn.dataset.copy;
+  const val = what === 'nsec' ? signupState.nsec : signupState.npub;
+  navigator.clipboard.writeText(val).then(() => {
+    const original = btn.textContent;
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = original;
+      btn.classList.remove('copied');
+    }, 1500);
+  });
+}
+
+function wizardDownload() {
+  if (!signupState) return;
+  const txt = [
+    '# Western Mass Bitcoin — Nostr account backup',
+    `# Generated: ${new Date().toISOString()}`,
+    '',
+    '# Your public key (share freely):',
+    signupState.npub,
+    '',
+    '# Your secret key (KEEP PRIVATE — anyone with this controls your account):',
+    signupState.nsec,
+    '',
+    '# How to use this:',
+    '# - Import the nsec into a Nostr client (Primal, Damus, Amethyst, etc.) to sign in.',
+    '# - Or paste it back into westernmassbitcoin.com/classifieds under "Paste nsec".',
+    '# - Treat it like a seed phrase: if you lose it, your account is gone.',
+  ].join('\n');
+
+  const blob = new Blob([txt], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `westernmassbitcoin-nostr-${signupState.npub.slice(0, 12)}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function wizardGoToStep(n) {
+  document.querySelectorAll('.wizard-pane').forEach(p => p.classList.toggle('active', +p.dataset.pane === n));
+  document.querySelectorAll('.wizard-step').forEach(s => {
+    const sn = +s.dataset.step;
+    s.classList.toggle('active', sn === n);
+    s.classList.toggle('done', sn < n);
+  });
+}
+
+async function wizardUploadProfileImage(e, which) {
+  const file = e.target.files?.[0];
+  e.target.value = '';
+  if (!file || !signupState) return;
+
+  const wrap = document.getElementById(which === 'pfp' ? 'wizard-pfp-pick' : 'wizard-banner-pick');
+  const placeholder = wrap.querySelector(which === 'pfp' ? '.wizard-pfp-placeholder' : '.wizard-banner-placeholder');
+
+  // Show local preview immediately
+  const preview = document.createElement('img');
+  const objectUrl = URL.createObjectURL(file);
+  preview.src = objectUrl;
+  // Remove any previous preview
+  wrap.querySelectorAll('img').forEach(el => el.remove());
+  wrap.querySelectorAll('.wizard-pfp-uploading, .wizard-banner-uploading').forEach(el => el.remove());
+  wrap.appendChild(preview);
+  if (placeholder) placeholder.style.display = 'none';
+  wrap.classList.add('has-image');
+
+  // Progress overlay
+  const overlay = document.createElement('span');
+  overlay.className = which === 'pfp' ? 'wizard-pfp-uploading' : 'wizard-banner-uploading';
+  overlay.textContent = 'Uploading…';
+  wrap.appendChild(overlay);
+
+  try {
+    const { url } = await uploadToBlossom(file, signupState);
+    if (which === 'pfp') signupState.pfpUrl = url;
+    else signupState.bannerUrl = url;
+    overlay.remove();
+  } catch (err) {
+    overlay.textContent = 'Upload failed';
+    setTimeout(() => {
+      preview.remove();
+      overlay.remove();
+      if (placeholder) placeholder.style.display = '';
+      wrap.classList.remove('has-image');
+      URL.revokeObjectURL(objectUrl);
+    }, 2000);
+  }
+}
+
+async function wizardStep2Submit() {
+  const name = document.getElementById('wizard-name').value.trim();
+  if (!name) {
+    document.getElementById('wizard-name').focus();
+    document.getElementById('wizard-name').reportValidity?.();
+    return;
+  }
+
+  signupState.name = name.toLowerCase().replace(/\s+/g, '');
+  signupState.displayName = document.getElementById('wizard-display-name').value.trim();
+  signupState.about = document.getElementById('wizard-about').value.trim();
+  signupState.lud16 = document.getElementById('wizard-lud16').value.trim();
+  signupState.website = document.getElementById('wizard-website').value.trim();
+
+  wizardGoToStep(3);
+  await wizardPublishAll();
+}
+
+function markWizardProgress(task, status) {
+  const li = document.querySelector(`.wizard-progress li[data-task="${task}"]`);
+  if (!li) return;
+  li.classList.remove('active', 'done', 'failed');
+  if (status) li.classList.add(status);
+  const icon = li.querySelector('.wizard-progress-icon');
+  if (icon) {
+    if (status === 'done') icon.textContent = '✓';
+    else if (status === 'failed') icon.textContent = '!';
+    else if (status === 'active') icon.textContent = '…';
+    else icon.textContent = '○';
+  }
+}
+
+async function wizardPublishAll() {
+  // Activate the new signer immediately so the rest of the page treats them as signed in
+  activeSigner = {
+    pubkey: signupState.pubkey,
+    kind: 'nsec',
+    signEvent: signupState.signEvent,
+  };
+
+  // Resolve which relays this user will write to
+  let userRelays = config.fallbackRelays;
+  let userDMRelays = config.fallbackDMRelays;
+  if (relayTemplateHex) {
+    try {
+      const tmpl = await fetchRelayTemplate();
+      if (tmpl.read?.length) userRelays = tmpl.read;
+      if (tmpl.dm?.length) userDMRelays = tmpl.dm;
+    } catch {
+      // fall back silently
+    }
+  }
+
+  // Always also publish to the site's relay set so the meetup can see the new user
+  const publishTo = [...new Set([...userRelays, ...config.relays])];
+
+  const now = () => Math.floor(Date.now() / 1000);
+  let anyFailed = false;
+
+  // ----- Kind 0: profile -----
+  markWizardProgress('profile', 'active');
+  try {
+    const profile = {
+      name: signupState.name,
+      ...(signupState.displayName && { display_name: signupState.displayName }),
+      ...(signupState.about && { about: signupState.about }),
+      ...(signupState.lud16 && { lud16: signupState.lud16 }),
+      ...(signupState.website && { website: signupState.website }),
+      ...(signupState.pfpUrl && { picture: signupState.pfpUrl }),
+      ...(signupState.bannerUrl && { banner: signupState.bannerUrl }),
+    };
+    const event = await signupState.signEvent({
+      kind: 0,
+      created_at: now(),
+      content: JSON.stringify(profile),
+      tags: [['client', 'westernmassbitcoin']],
+    });
+    await publishOrThrow(publishTo, event);
+    markWizardProgress('profile', 'done');
+    profiles.set(signupState.pubkey, profile);
+  } catch (err) {
+    anyFailed = true;
+    markWizardProgress('profile', 'failed');
+  }
+
+  // ----- Kind 10002: outbox relays -----
+  markWizardProgress('relays', 'active');
+  try {
+    const event = await signupState.signEvent({
+      kind: 10002,
+      created_at: now(),
+      content: '',
+      tags: [
+        ...userRelays.map(r => ['r', r]),
+        ['client', 'westernmassbitcoin'],
+      ],
+    });
+    await publishOrThrow(publishTo, event);
+    markWizardProgress('relays', 'done');
+  } catch (err) {
+    anyFailed = true;
+    markWizardProgress('relays', 'failed');
+  }
+
+  // ----- Kind 10050: DM inbox relays -----
+  markWizardProgress('dmrelays', 'active');
+  try {
+    const event = await signupState.signEvent({
+      kind: 10050,
+      created_at: now(),
+      content: '',
+      tags: [
+        ...userDMRelays.map(r => ['relay', r]),
+        ['client', 'westernmassbitcoin'],
+      ],
+    });
+    await publishOrThrow(publishTo, event);
+    markWizardProgress('dmrelays', 'done');
+  } catch (err) {
+    anyFailed = true;
+    markWizardProgress('dmrelays', 'failed');
+  }
+
+  // ----- Kind 3: contacts (whitelist + meetup) -----
+  markWizardProgress('contacts', 'active');
+  try {
+    const contacts = new Set();
+    whitelistHex.forEach(p => contacts.add(p));
+    if (meetupHex) contacts.add(meetupHex);
+    // Don't include the user's own pubkey in their follow list
+    contacts.delete(signupState.pubkey);
+
+    const event = await signupState.signEvent({
+      kind: 3,
+      created_at: now(),
+      content: '',
+      tags: [
+        ...[...contacts].map(p => ['p', p]),
+        ['client', 'westernmassbitcoin'],
+      ],
+    });
+    await publishOrThrow(publishTo, event);
+    markWizardProgress('contacts', 'done');
+  } catch (err) {
+    anyFailed = true;
+    markWizardProgress('contacts', 'failed');
+  }
+
+  // Reveal final card
+  const errBox = document.getElementById('wizard-error');
+  if (anyFailed) {
+    errBox.style.display = 'block';
+    errBox.textContent = 'Some steps couldn\'t reach every relay. Your account still works — you can try again from another Nostr client later.';
+  }
+  document.getElementById('wizard-final').style.display = 'block';
+}
+
+async function publishOrThrow(relays, event) {
+  const results = await Promise.allSettled(pool.publish(relays, event));
+  const ok = results.filter(r => r.status === 'fulfilled').length;
+  if (ok === 0) throw new Error('No relays accepted the event.');
+}
+
+function fetchRelayTemplate() {
+  return new Promise((resolve) => {
+    if (!relayTemplateHex) return resolve({ read: null, dm: null });
+    let kind10002 = null;
+    let kind10050 = null;
+
+    const finalize = () => {
+      const read = kind10002
+        ? kind10002.tags.filter(t => t[0] === 'r' && /^wss?:\/\//.test(t[1] || '')).map(t => t[1])
+        : null;
+      const dm = kind10050
+        ? kind10050.tags.filter(t => t[0] === 'relay' && /^wss?:\/\//.test(t[1] || '')).map(t => t[1])
+        : null;
+      resolve({ read, dm });
+    };
+
+    const sub = pool.subscribeMany(
+      config.relays,
+      [{ kinds: [10002, 10050], authors: [relayTemplateHex] }],
+      {
+        onevent(event) {
+          if (event.kind === 10002 && (!kind10002 || event.created_at > kind10002.created_at)) kind10002 = event;
+          if (event.kind === 10050 && (!kind10050 || event.created_at > kind10050.created_at)) kind10050 = event;
+        },
+        oneose() {
+          sub.close();
+          finalize();
+        }
+      }
+    );
+    setTimeout(() => {
+      sub.close();
+      finalize();
+    }, 5000);
+  });
+}
+
+function wizardFinish() {
+  cfCloseModal('signup-modal');
+  renderUserChip();
+  // Reset wizard so re-opening starts fresh
+  setTimeout(resetWizard, 400);
+}
+
+function resetWizard() {
+  signupState = null;
+  document.getElementById('wizard-keygen-pre').style.display = '';
+  document.getElementById('wizard-keygen-post').style.display = 'none';
+  document.getElementById('wizard-saved-checkbox').checked = false;
+  document.getElementById('wizard-step1-next').disabled = true;
+  ['wizard-name', 'wizard-display-name', 'wizard-about', 'wizard-lud16', 'wizard-website'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  document.querySelectorAll('#wizard-pfp-pick img, #wizard-banner-pick img').forEach(el => el.remove());
+  document.querySelectorAll('.wizard-pfp-placeholder, .wizard-banner-placeholder').forEach(el => el.style.display = '');
+  document.getElementById('wizard-pfp-pick').classList.remove('has-image');
+  document.getElementById('wizard-banner-pick').classList.remove('has-image');
+  document.querySelectorAll('.wizard-progress li').forEach(li => {
+    li.classList.remove('active', 'done', 'failed');
+    const icon = li.querySelector('.wizard-progress-icon');
+    if (icon) icon.textContent = '○';
+  });
+  document.getElementById('wizard-final').style.display = 'none';
+  document.getElementById('wizard-error').style.display = 'none';
+  wizardGoToStep(1);
 }

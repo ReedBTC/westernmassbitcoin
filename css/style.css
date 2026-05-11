@@ -2135,6 +2135,377 @@ a:hover {
   border-top: 1px solid var(--border);
 }
 
+/* ============================================================
+   Signup Wizard
+   ============================================================ */
+.wizard-steps {
+  display: flex;
+  gap: 0;
+  margin-top: 16px;
+  border-bottom: 1px solid var(--border);
+  margin-left: -28px;
+  margin-right: -28px;
+  padding: 0 28px;
+}
+
+.wizard-step {
+  flex: 1;
+  padding: 10px 6px;
+  text-align: center;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  border-bottom: 2px solid transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: color var(--transition), border-color var(--transition);
+}
+
+.wizard-step.active {
+  color: var(--orange);
+  border-bottom-color: var(--orange);
+}
+
+.wizard-step.done {
+  color: var(--text-muted);
+}
+
+.wizard-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.wizard-step.active .wizard-step-num {
+  background: var(--orange);
+  color: #000;
+  border-color: var(--orange);
+}
+
+.wizard-step.done .wizard-step-num {
+  background: rgba(247, 147, 26, 0.2);
+  color: var(--orange);
+  border-color: var(--orange);
+}
+
+.wizard-pane {
+  display: none;
+}
+
+.wizard-pane.active {
+  display: block;
+}
+
+.wizard-key-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-top: 16px;
+}
+
+.wizard-key-block-secret {
+  border-color: rgba(247, 147, 26, 0.4);
+  background: linear-gradient(135deg, rgba(247,147,26,0.05), rgba(247,147,26,0.02));
+}
+
+.wizard-key-block label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.wizard-key-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.wizard-key-row code {
+  flex: 1;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font-size: 0.78rem;
+  font-family: monospace;
+  word-break: break-all;
+  color: var(--text);
+  user-select: all;
+}
+
+.wizard-key-copy {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 0 14px;
+  font-size: 0.85rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.wizard-key-copy:hover {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+
+.wizard-key-copy.copied {
+  background: var(--orange);
+  color: #000;
+  border-color: var(--orange);
+}
+
+.wizard-key-warning {
+  margin-top: 10px;
+  font-size: 0.82rem;
+  color: #f5a623;
+  line-height: 1.5;
+}
+
+.wizard-key-actions {
+  margin-top: 12px;
+}
+
+.wizard-confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 20px;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 0.88rem;
+  color: var(--text);
+  line-height: 1.5;
+  user-select: none;
+}
+
+.wizard-confirm input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--orange);
+  cursor: pointer;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.wizard-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.wizard-banner-wrap {
+  position: relative;
+  margin-bottom: 56px;
+}
+
+.wizard-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 140px;
+  background: var(--bg3);
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+  overflow: hidden;
+  position: relative;
+  transition: border-color var(--transition);
+}
+
+.wizard-banner:hover {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+
+.wizard-banner img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.wizard-banner-placeholder {
+  position: relative;
+  z-index: 1;
+  background: rgba(0, 0, 0, 0.5);
+  padding: 4px 10px;
+  border-radius: 4px;
+}
+
+.wizard-banner.has-image {
+  border-style: solid;
+}
+
+.wizard-pfp {
+  position: absolute;
+  bottom: -40px;
+  left: 20px;
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  background: var(--bg3);
+  border: 3px solid var(--bg2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  transition: border-color var(--transition);
+}
+
+.wizard-pfp:hover {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+
+.wizard-pfp img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.wizard-pfp-uploading,
+.wizard-banner-uploading {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--orange);
+  font-size: 0.85rem;
+  z-index: 2;
+}
+
+.wizard-progress {
+  list-style: none;
+  padding: 0;
+  margin: 16px 0 0;
+}
+
+.wizard-progress li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.92rem;
+}
+
+.wizard-progress li:last-child {
+  border-bottom: none;
+}
+
+.wizard-progress li.active {
+  color: var(--text);
+}
+
+.wizard-progress li.done {
+  color: var(--orange);
+}
+
+.wizard-progress li.failed {
+  color: #ff6b6b;
+}
+
+.wizard-progress-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.wizard-progress li.active .wizard-progress-icon {
+  background: var(--bg3);
+  color: var(--orange);
+  border-color: var(--orange);
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.wizard-progress li.done .wizard-progress-icon {
+  background: var(--orange);
+  color: #000;
+  border-color: var(--orange);
+  animation: none;
+}
+
+.wizard-progress li.failed .wizard-progress-icon {
+  background: #ff6b6b;
+  color: #000;
+  border-color: #ff6b6b;
+  animation: none;
+}
+
+.wizard-final {
+  background: var(--bg);
+  border: 1px solid rgba(247, 147, 26, 0.3);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-top: 16px;
+  line-height: 1.6;
+}
+
+.wizard-error {
+  background: rgba(255, 107, 107, 0.1);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  color: #ff6b6b;
+  margin-top: 16px;
+  font-size: 0.9rem;
+}
+
+@media (max-width: 500px) {
+  .wizard-step {
+    font-size: 0.72rem;
+    padding: 8px 4px;
+    gap: 5px;
+  }
+  .wizard-step-num {
+    width: 18px;
+    height: 18px;
+  }
+}
+
 .composer-status {
   margin-top: 12px;
   padding: 10px 12px;
