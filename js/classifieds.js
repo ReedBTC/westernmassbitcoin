@@ -15,6 +15,7 @@ import {
   getPublicKey,
 } from 'https://esm.sh/nostr-tools@2.7.2';
 import { BunkerSigner, parseBunkerInput } from 'https://esm.sh/nostr-tools@2.7.2/nip46';
+import { sha256 as nobleSha256 } from 'https://esm.sh/@noble/hashes@1.4.0/sha256';
 
 // ============================================================
 // Config + state
@@ -52,7 +53,90 @@ let activeSigner = null;      // { pubkey, signEvent, kind, close? }
   wireUI();
   await loadWhitelist();
   loadListings();
+
+  // Restore a previously-saved session, if any. Non-blocking — listings load in parallel.
+  tryRestoreSession();
 })();
+
+// ============================================================
+// Session persistence (localStorage)
+// ============================================================
+const SESSION_KEY = 'westernmassbitcoin:session';
+
+function saveSession(data) {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify(data)); } catch {}
+}
+function loadSavedSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function clearSavedSession() {
+  try { localStorage.removeItem(SESSION_KEY); } catch {}
+}
+
+async function tryRestoreSession() {
+  const session = loadSavedSession();
+  if (!session) return;
+
+  try {
+    if (session.kind === 'nsec' && session.nsec) {
+      const decoded = nip19.decode(session.nsec);
+      if (decoded.type !== 'nsec') throw new Error('Not an nsec');
+      const secretKey = decoded.data;
+      const pubkey = getPublicKey(secretKey);
+      activeSigner = {
+        pubkey,
+        kind: 'nsec',
+        signEvent: async (event) => finalizeEvent(event, secretKey),
+      };
+    } else if (session.kind === 'nip07' && session.pubkey) {
+      if (!window.nostr) return; // extension not installed in this browser — leave saved data alone
+      const pubkey = await window.nostr.getPublicKey();
+      if (pubkey !== session.pubkey) return clearSavedSession(); // user switched accounts
+      activeSigner = {
+        pubkey,
+        kind: 'nip07',
+        signEvent: async (event) => window.nostr.signEvent(event),
+      };
+    } else if (session.kind === 'nip46' && session.bunkerUri && session.clientSecretKey) {
+      const pointer = await parseBunkerInput(session.bunkerUri);
+      if (!pointer) throw new Error('Could not parse saved bunker URL.');
+      const clientKey = hexToBytes(session.clientSecretKey);
+      const signer = new BunkerSigner(clientKey, pointer, { pool });
+      await signer.connect();
+      const pubkey = await signer.getPublicKey();
+      activeSigner = {
+        pubkey,
+        kind: 'nip46',
+        signEvent: async (event) => signer.signEvent(event),
+        close: () => signer.close?.(),
+      };
+    } else {
+      clearSavedSession();
+      return;
+    }
+
+    if (activeSigner) {
+      renderUserChip();
+      // Lazy-fetch the user's profile so the chip displays nicely on first paint
+      if (!profiles.has(activeSigner.pubkey)) fetchProfiles([activeSigner.pubkey]);
+    }
+  } catch (err) {
+    console.warn('[classifieds] session restore failed:', err);
+    clearSavedSession();
+  }
+}
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+function bytesToHex(bytes) {
+  return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+}
 
 // ============================================================
 // Whitelist: derived from meetup npub's kind 3 contact list
@@ -180,10 +264,34 @@ function loadListings() {
 
   grid.innerHTML = '<div class="listing-loading">Connecting to relays…</div>';
 
-  let eventCount = 0;
+  // Render-as-events-arrive: a card appears the moment its event reaches us,
+  // instead of waiting for every relay to EOSE.
+  let renderScheduled = false;
+  let firstEventArrived = false;
   let eosed = false;
+  let profileFetchTimer = null;
 
-  const sub = pool.subscribeMany(
+  const scheduleRender = () => {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    requestAnimationFrame(() => {
+      renderScheduled = false;
+      renderGrid();
+    });
+  };
+
+  // Batch profile fetches: each new event resets a 150ms timer; when events
+  // stop arriving, fire one fetch for all authors we've collected.
+  const scheduleProfileFetch = () => {
+    if (profileFetchTimer) clearTimeout(profileFetchTimer);
+    profileFetchTimer = setTimeout(() => {
+      profileFetchTimer = null;
+      const authors = [...new Set([...listings.values()].map(e => e.pubkey))];
+      if (authors.length) fetchProfiles(authors);
+    }, 150);
+  };
+
+  pool.subscribeMany(
     config.relays,
     [{ kinds: [30402], authors: whitelistHex }],
     {
@@ -192,33 +300,28 @@ function loadListings() {
         const key = `${event.pubkey}:${dTag}`;
         const existing = listings.get(key);
         if (!existing || event.created_at > existing.created_at) {
-          // Skip if status:sold tag is set
           const status = event.tags.find(t => t[0] === 'status')?.[1];
           if (status === 'sold' || status === 'inactive') {
             listings.delete(key);
           } else {
             listings.set(key, event);
           }
-          eventCount++;
-          if (eosed) renderGrid();
+          firstEventArrived = true;
+          scheduleRender();
+          scheduleProfileFetch();
         }
       },
       oneose() {
         eosed = true;
+        // Final render to settle the status line ("X listings from N sellers").
         renderGrid();
-        // Lazy-fetch seller profiles after we know who they are
-        const authors = [...new Set([...listings.values()].map(e => e.pubkey))];
-        if (authors.length) fetchProfiles(authors);
       }
     }
   );
 
-  // Safety timeout: if no EOSE within 8s, render whatever we have
+  // Safety net: if no event AND no EOSE arrives in 8s, render the empty state.
   setTimeout(() => {
-    if (!eosed) {
-      eosed = true;
-      renderGrid();
-    }
+    if (!eosed && !firstEventArrived) renderGrid();
   }, 8000);
 }
 
@@ -586,6 +689,7 @@ async function loginWithNip07() {
       kind: 'nip07',
       signEvent: async (event) => await window.nostr.signEvent(event),
     };
+    saveSession({ kind: 'nip07', pubkey });
     onLogin();
   } catch (err) {
     alert('Sign-in failed: ' + (err.message || err));
@@ -621,6 +725,12 @@ async function loginWithBunker() {
       signEvent: async (event) => await signer.signEvent(event),
       close: () => signer.close?.(),
     };
+    saveSession({
+      kind: 'nip46',
+      pubkey,
+      bunkerUri: input,
+      clientSecretKey: bytesToHex(clientKey),
+    });
     onLogin();
   } catch (err) {
     statusEl.classList.add('error');
@@ -647,6 +757,7 @@ async function loginWithNsec() {
       kind: 'nsec',
       signEvent: async (event) => finalizeEvent(event, secretKey),
     };
+    saveSession({ kind: 'nsec', nsec: val });
     // Best-effort: clear the input
     document.getElementById('login-nsec-input').value = '';
     onLogin();
@@ -710,6 +821,7 @@ function renderUserChip() {
 function logout() {
   try { activeSigner?.close?.(); } catch {}
   activeSigner = null;
+  clearSavedSession();
   const actions = document.getElementById('cf-toolbar-actions');
   actions.innerHTML = '';
   const btn = document.createElement('button');
@@ -786,11 +898,19 @@ async function uploadImage(file) {
     slot.pending = false;
     prog.remove();
   } catch (err) {
-    composerStatus('Image upload failed: ' + (err.message || err), 'error');
+    console.error('[classifieds] Blossom upload failed:', err, { file: file.name, size: file.size, type: file.type });
+    const msg = err?.message || String(err);
+    prog.textContent = 'Failed: ' + msg.slice(0, 60);
+    prog.style.background = 'rgba(255, 107, 107, 0.85)';
+    prog.style.color = '#000';
+    composerStatus('Image upload failed: ' + msg, 'error');
     const i = composerImages.indexOf(slot);
     if (i >= 0) composerImages.splice(i, 1);
-    wrap.remove();
-    URL.revokeObjectURL(fileUrl);
+    // Leave the failed slot on screen for 4s so the error is readable, then clean up.
+    setTimeout(() => {
+      wrap.remove();
+      URL.revokeObjectURL(fileUrl);
+    }, 4000);
   }
 
   hideAddButtonIfFull();
@@ -859,9 +979,28 @@ async function publishListing(e) {
     const targetRelays = quiet && config.quietRelay ? [config.quietRelay] : config.relays;
     composerStatus(quiet ? `Publishing quietly to ${config.quietRelay}…` : 'Publishing to relays…', 'success');
 
-    const results = await Promise.allSettled(pool.publish(targetRelays, event));
+    // Per-relay timeout so a single hung relay can't block the whole publish.
+    const PER_RELAY_TIMEOUT = 4000;
+    const promises = pool.publish(targetRelays, event).map(p =>
+      Promise.race([
+        p,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('relay timeout')), PER_RELAY_TIMEOUT)),
+      ])
+    );
+    const results = await Promise.allSettled(promises);
     const ok = results.filter(r => r.status === 'fulfilled').length;
-    if (ok === 0) throw new Error(quiet ? 'The quiet relay did not accept the listing.' : 'No relays accepted the listing.');
+    if (ok === 0) {
+      const reasons = results
+        .map((r, i) => r.status === 'rejected'
+          ? `${targetRelays[i]}: ${r.reason?.message || r.reason}`
+          : null)
+        .filter(Boolean);
+      console.error('[classifieds] publish rejected by all relays:', results);
+      const base = quiet
+        ? 'The quiet relay did not accept the listing.'
+        : 'No relays accepted the listing.';
+      throw new Error(reasons.length ? `${base} — ${reasons.join(' | ')}` : base);
+    }
 
     const quietNote = quiet ? ' (quiet mode — only on relay.mynostr.app)' : '';
     composerStatus(`Published to ${ok}/${results.length} relay${results.length === 1 ? '' : 's'}${quietNote}. ${whitelistHex.includes(activeSigner.pubkey) ? 'Your listing will appear here shortly.' : 'Your listing is live on Nostr — email reedlabarge@gmail.com with your npub so we can add you to the meetup whitelist and it will appear here.'}`, 'success');
@@ -905,8 +1044,10 @@ async function uploadToBlossom(file, signer) {
   if (!signer) throw new Error('Not signed in.');
 
   const buf = await file.arrayBuffer();
-  const hashBuf = await crypto.subtle.digest('SHA-256', buf);
-  const sha256 = [...new Uint8Array(hashBuf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  // Use noble/hashes instead of crypto.subtle so this works on HTTP/LAN dev
+  // origins too (crypto.subtle is only exposed on HTTPS or localhost).
+  const hashBytes = nobleSha256(new Uint8Array(buf));
+  const sha256 = [...hashBytes].map(b => b.toString(16).padStart(2, '0')).join('');
 
   const authEvent = await signer.signEvent({
     kind: 24242,
@@ -1124,14 +1265,15 @@ async function wizardPublishAll() {
     signEvent: signupState.signEvent,
   };
 
-  // Resolve which relays this user will write to
-  let userRelays = config.fallbackRelays;
+  // New accounts always get a curated read/write relay list (config.newAccountRelays).
+  // DM relays attempt to copy from the meetup organizer's kind 10050, falling back
+  // to config.fallbackDMRelays when the fetch returns nothing.
+  const userRelays = config.newAccountRelays || config.relays;
   let userDMRelays = config.fallbackDMRelays;
   if (relayTemplateHex) {
     try {
-      const tmpl = await fetchRelayTemplate();
-      if (tmpl.read?.length) userRelays = tmpl.read;
-      if (tmpl.dm?.length) userDMRelays = tmpl.dm;
+      const dmRelays = await fetchDMRelayTemplate();
+      if (dmRelays?.length) userDMRelays = dmRelays;
     } catch {
       // fall back silently
     }
@@ -1241,35 +1383,72 @@ async function wizardPublishAll() {
   document.getElementById('wizard-final').style.display = 'block';
 }
 
-async function publishOrThrow(relays, event) {
-  const results = await Promise.allSettled(pool.publish(relays, event));
-  const ok = results.filter(r => r.status === 'fulfilled').length;
-  if (ok === 0) throw new Error('No relays accepted the event.');
+// Publish an event and resolve as soon as ONE relay ACKs it.
+// Per-relay timeout caps how long a single hung relay can block us; the
+// overall timeout caps the worst case when every relay is unreachable.
+// Sends still go out to all listed relays — we just stop waiting on them.
+function publishOrThrow(relays, event, opts = {}) {
+  const { perRelayTimeout = 4000, overallTimeout = 6000 } = opts;
+  return new Promise((resolve, reject) => {
+    const promises = pool.publish(relays, event);
+    if (!promises.length) return reject(new Error('No relays to publish to.'));
+
+    let acks = 0;
+    let settled = 0;
+    let done = false;
+    const reasons = [];
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      err ? reject(err) : resolve();
+    };
+
+    promises.forEach((p, i) => {
+      const timeout = new Promise((_, rej) =>
+        setTimeout(() => rej(new Error('relay timeout')), perRelayTimeout)
+      );
+      Promise.race([p, timeout])
+        .then(() => { acks++; finish(); })          // first ACK wins
+        .catch((err) => { reasons.push(`${relays[i]}: ${err?.message || err}`); })
+        .finally(() => {
+          settled++;
+          if (settled === promises.length && acks === 0) {
+            console.error('[classifieds] publishOrThrow: every relay rejected', reasons);
+            finish(new Error(`No relays accepted the event. ${reasons.join(' | ')}`));
+          }
+        });
+    });
+
+    setTimeout(() => {
+      if (acks > 0) finish(null);
+      else {
+        console.error('[classifieds] publishOrThrow: timed out with no acks', reasons);
+        finish(new Error(`No relays responded in time. ${reasons.join(' | ')}`));
+      }
+    }, overallTimeout);
+  });
 }
 
-function fetchRelayTemplate() {
+// Fetch the meetup organizer's kind-10050 (NIP-17 DM inbox relays) so new
+// accounts inherit the same DM relays. Returns null if the event isn't found.
+function fetchDMRelayTemplate() {
   return new Promise((resolve) => {
-    if (!relayTemplateHex) return resolve({ read: null, dm: null });
-    let kind10002 = null;
-    let kind10050 = null;
+    if (!relayTemplateHex) return resolve(null);
+    let latest = null;
 
     const finalize = () => {
-      const read = kind10002
-        ? kind10002.tags.filter(t => t[0] === 'r' && /^wss?:\/\//.test(t[1] || '')).map(t => t[1])
+      const dm = latest
+        ? latest.tags.filter(t => t[0] === 'relay' && /^wss?:\/\//.test(t[1] || '')).map(t => t[1])
         : null;
-      const dm = kind10050
-        ? kind10050.tags.filter(t => t[0] === 'relay' && /^wss?:\/\//.test(t[1] || '')).map(t => t[1])
-        : null;
-      resolve({ read, dm });
+      resolve(dm);
     };
 
     const sub = pool.subscribeMany(
       config.relays,
-      [{ kinds: [10002, 10050], authors: [relayTemplateHex] }],
+      [{ kinds: [10050], authors: [relayTemplateHex], limit: 1 }],
       {
         onevent(event) {
-          if (event.kind === 10002 && (!kind10002 || event.created_at > kind10002.created_at)) kind10002 = event;
-          if (event.kind === 10050 && (!kind10050 || event.created_at > kind10050.created_at)) kind10050 = event;
+          if (!latest || event.created_at > latest.created_at) latest = event;
         },
         oneose() {
           sub.close();
@@ -1285,6 +1464,8 @@ function fetchRelayTemplate() {
 }
 
 function wizardFinish() {
+  // Persist so refresh / next visit keeps them signed in
+  if (signupState?.nsec) saveSession({ kind: 'nsec', nsec: signupState.nsec });
   cfCloseModal('signup-modal');
   renderUserChip();
   // Reset wizard so re-opening starts fresh

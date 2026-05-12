@@ -5,7 +5,6 @@
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.primal.net",
-    "wss://relay.nostr.band",
     "wss://relay.plebeian.market",
     "wss://relay.mynostr.app"
   ],
@@ -13,11 +12,15 @@
   "blossom": {
     "server": "https://blossom.primal.net"
   },
-  "fallbackRelays": [
+  "newAccountRelays": [
     "wss://relay.primal.net",
     "wss://relay.damus.io",
     "wss://purplepag.es",
-    "wss://relay.plebeian.market"
+    "wss://relay.ditto.pub",
+    "wss://nos.lol",
+    "wss://relay.plebeian.market",
+    "wss://purplerelay.com",
+    "wss://relay.getalby.com"
   ],
   "fallbackDMRelays": [
     "wss://relay.0xchat.com",
