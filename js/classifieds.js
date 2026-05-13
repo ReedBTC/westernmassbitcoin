@@ -15,7 +15,17 @@ import {
   getPublicKey,
 } from 'https://esm.sh/nostr-tools@2.7.2';
 import { BunkerSigner, parseBunkerInput } from 'https://esm.sh/nostr-tools@2.7.2/nip46';
+import * as nip44 from 'https://esm.sh/nostr-tools@2.7.2/nip44';
 import { sha256 as nobleSha256 } from 'https://esm.sh/@noble/hashes@1.4.0/sha256';
+
+import {
+  mountDmPanelDOM,
+  activateDmPanel,
+  deactivateDmPanel,
+  openDmPanel,
+  openDmThreadWith,
+  refreshOnboarding as refreshDmPanelOnboarding,
+} from './dm-panel.js';
 
 // ============================================================
 // Config + state
@@ -27,7 +37,20 @@ let relayTemplateHex = null;  // hex pubkey we copy kind 10002 + 10050 from for 
 let pool = null;
 const listings = new Map();   // d-tag-key -> latest event
 const profiles = new Map();   // hex pubkey -> kind 0 metadata
-let activeSigner = null;      // { pubkey, signEvent, kind, close? }
+let activeSigner = null;      // { pubkey, signEvent, kind, close?, nip44Encrypt, nip44Decrypt, supportsNip44 }
+
+// Pending action to run after a successful login/wizard finish.
+// Set by callers that opened the login modal with a specific intent
+// (e.g. "message this seller"). Null means: open the composer (default).
+let pendingPostLoginAction = null;
+
+// DM-related state (NIP-17)
+const dmRelaysByPubkey = new Map();      // hex -> string[] (empty array = resolved-negative)
+const dmRelaysMeta = new Map();          // hex -> latest seen kind-10050 created_at
+let dmRelaysWhitelistFetched = false;    // true once the whitelist 10050 fetch has EOSE'd
+let userDmRelays = null;                 // string[] | null — current user's own DM relays
+const userFollowSet = new Set();         // current user's kind 3 follows (hex)
+let dmRelaysSubAd = null;                // ad-hoc 10050 sub for non-whitelist peers
 
 // ============================================================
 // Boot
@@ -51,8 +74,10 @@ let activeSigner = null;      // { pubkey, signEvent, kind, close? }
   pool = new SimplePool();
 
   wireUI();
+  mountDmPanelDOM();
   await loadWhitelist();
   loadListings();
+  fetchWhitelistDMRelays();
 
   // Restore a previously-saved session, if any. Non-blocking — listings load in parallel.
   tryRestoreSession();
@@ -76,6 +101,47 @@ function clearSavedSession() {
   try { localStorage.removeItem(SESSION_KEY); } catch {}
 }
 
+// ============================================================
+// NIP-44 adapters (per-signer-kind)
+// ============================================================
+// activeSigner exposes nip44Encrypt/Decrypt so the DM module can
+// stay signer-agnostic. We build the right adapter at login time
+// because each kind closes over different state.
+function nip44ForNsec(secretKey) {
+  return {
+    supportsNip44: true,
+    nip44Encrypt: async (peerPk, plaintext) => {
+      const ck = nip44.v2.utils.getConversationKey(secretKey, peerPk);
+      return nip44.v2.encrypt(plaintext, ck);
+    },
+    nip44Decrypt: async (peerPk, ciphertext) => {
+      const ck = nip44.v2.utils.getConversationKey(secretKey, peerPk);
+      return nip44.v2.decrypt(ciphertext, ck);
+    },
+  };
+}
+function nip44ForNip07() {
+  const supported = !!(window.nostr?.nip44?.encrypt && window.nostr?.nip44?.decrypt);
+  return {
+    supportsNip44: supported,
+    nip44Encrypt: async (peerPk, plaintext) => {
+      if (!supported) throw new Error('Your Nostr extension does not support NIP-44. Update Alby, nos2x, or keys.band — or sign in with a different method to use DMs.');
+      return window.nostr.nip44.encrypt(peerPk, plaintext);
+    },
+    nip44Decrypt: async (peerPk, ciphertext) => {
+      if (!supported) throw new Error('Your Nostr extension does not support NIP-44.');
+      return window.nostr.nip44.decrypt(peerPk, ciphertext);
+    },
+  };
+}
+function nip44ForBunker(bunkerSigner) {
+  return {
+    supportsNip44: true,
+    nip44Encrypt: async (peerPk, plaintext) => bunkerSigner.nip44Encrypt(peerPk, plaintext),
+    nip44Decrypt: async (peerPk, ciphertext) => bunkerSigner.nip44Decrypt(peerPk, ciphertext),
+  };
+}
+
 async function tryRestoreSession() {
   const session = loadSavedSession();
   if (!session) return;
@@ -90,6 +156,7 @@ async function tryRestoreSession() {
         pubkey,
         kind: 'nsec',
         signEvent: async (event) => finalizeEvent(event, secretKey),
+        ...nip44ForNsec(secretKey),
       };
     } else if (session.kind === 'nip07' && session.pubkey) {
       if (!window.nostr) return; // extension not installed in this browser — leave saved data alone
@@ -99,6 +166,7 @@ async function tryRestoreSession() {
         pubkey,
         kind: 'nip07',
         signEvent: async (event) => window.nostr.signEvent(event),
+        ...nip44ForNip07(),
       };
     } else if (session.kind === 'nip46' && session.bunkerUri && session.clientSecretKey) {
       const pointer = await parseBunkerInput(session.bunkerUri);
@@ -112,6 +180,7 @@ async function tryRestoreSession() {
         kind: 'nip46',
         signEvent: async (event) => signer.signEvent(event),
         close: () => signer.close?.(),
+        ...nip44ForBunker(signer),
       };
     } else {
       clearSavedSession();
@@ -122,6 +191,8 @@ async function tryRestoreSession() {
       renderUserChip();
       // Lazy-fetch the user's profile so the chip displays nicely on first paint
       if (!profiles.has(activeSigner.pubkey)) fetchProfiles([activeSigner.pubkey]);
+      // Kick off DM-related work (own 10050, own kind 3, activate panel)
+      onSignerReady();
     }
   } catch (err) {
     console.warn('[classifieds] session restore failed:', err);
@@ -201,6 +272,16 @@ function wireUI() {
       openLogin();
     }
   });
+  document.getElementById('cf-signin-btn').addEventListener('click', () => {
+    if (activeSigner) {
+      openDmPanel();
+    } else {
+      // After sign-in, slide the DM panel open — that's the implicit reason
+      // for clicking "Sign In" (vs. clicking "Post a Listing" which routes
+      // to the composer instead).
+      openLogin({ pendingAction: () => openDmPanel() });
+    }
+  });
 
   // Login options
   document.querySelectorAll('.login-option').forEach(btn => {
@@ -223,6 +304,28 @@ function wireUI() {
 
   // Signup wizard
   wireSignupWizard();
+
+  // DM persistent banner
+  wireDmBanner();
+
+  // Clear any pending post-login intent if the user cancels the login/signup
+  // flow (overlay click, X button, or Escape). Choosing Sign Up from inside
+  // the login modal keeps the intent because that's a continuation, not a cancel.
+  const loginModal = document.getElementById('login-modal');
+  const signupModal = document.getElementById('signup-modal');
+  [loginModal, signupModal].forEach(modal => {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal || e.target.matches('[data-close]')) {
+        pendingPostLoginAction = null;
+      }
+    });
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (loginModal.classList.contains('open') || signupModal.classList.contains('open')) {
+      pendingPostLoginAction = null;
+    }
+  });
 
   // Help tips (click to toggle on mobile, hover/focus already handled by CSS)
   document.querySelectorAll('.help-tip').forEach(tip => {
@@ -327,19 +430,35 @@ function loadListings() {
 
 function renderGrid() {
   const grid = document.getElementById('cf-grid');
-  const sorted = [...listings.values()].sort((a, b) => {
-    const aPub = +(a.tags.find(t => t[0] === 'published_at')?.[1] || a.created_at);
-    const bPub = +(b.tags.find(t => t[0] === 'published_at')?.[1] || b.created_at);
-    return bPub - aPub;
-  });
+
+  // Only show listings whose author has published a kind 10050 — that way
+  // every "Message Seller" button has somewhere to deliver to. Authors we
+  // haven't resolved yet are held back; after EOSE every whitelist member
+  // gets a definitive answer (empty array == no DM relays, hide forever).
+  const sellersWithDM = new Set(
+    whitelistHex.filter(p => (dmRelaysByPubkey.get(p) || []).length > 0)
+  );
+
+  const sorted = [...listings.values()]
+    .filter(e => sellersWithDM.has(e.pubkey))
+    .sort((a, b) => {
+      const aPub = +(a.tags.find(t => t[0] === 'published_at')?.[1] || a.created_at);
+      const bPub = +(b.tags.find(t => t[0] === 'published_at')?.[1] || b.created_at);
+      return bPub - aPub;
+    });
+
+  const sellerCountText = `${sellersWithDM.size} verified seller${sellersWithDM.size === 1 ? '' : 's'}`;
+  const settling = !dmRelaysWhitelistFetched;
 
   if (!sorted.length) {
     grid.innerHTML = '';
     const empty = document.createElement('div');
     empty.className = 'listing-empty';
-    empty.textContent = 'No listings yet. Check back soon — or be the first member to post one.';
+    empty.textContent = settling
+      ? 'Loading…'
+      : 'No listings yet. Check back soon — or be the first member to post one.';
     grid.appendChild(empty);
-    setStatus(`0 listings from ${whitelistHex.length} verified seller${whitelistHex.length === 1 ? '' : 's'}.`);
+    setStatus(settling ? 'Checking which sellers have NIP-17 DMs enabled…' : `0 listings from ${sellerCountText}.`);
     return;
   }
 
@@ -347,7 +466,7 @@ function renderGrid() {
   for (const event of sorted) {
     grid.appendChild(renderCard(event));
   }
-  setStatus(`<strong>${sorted.length}</strong> listing${sorted.length === 1 ? '' : 's'} from ${whitelistHex.length} verified seller${whitelistHex.length === 1 ? '' : 's'}.`);
+  setStatus(`<strong>${sorted.length}</strong> listing${sorted.length === 1 ? '' : 's'} from ${sellerCountText}.`);
 }
 
 function renderCard(event) {
@@ -581,6 +700,33 @@ function openListing(event) {
   sInfo.appendChild(sLink);
   sellerEl.appendChild(sImg);
   sellerEl.appendChild(sInfo);
+
+  // Message Seller button — opens the DM panel and pre-selects the thread.
+  // Disabled (with explanation) if the seller hasn't published kind 10050;
+  // shouldn't normally happen because such listings are filtered out, but
+  // we render defensively in case state lags.
+  const msgBtn = document.createElement('button');
+  msgBtn.className = 'btn btn-orange listing-modal-message-btn';
+  msgBtn.type = 'button';
+  msgBtn.textContent = 'Message Seller';
+  const sellerHasDM = (dmRelaysByPubkey.get(event.pubkey) || []).length > 0;
+  if (event.pubkey === activeSigner?.pubkey) {
+    msgBtn.disabled = true;
+    msgBtn.title = "That's you.";
+  } else if (!sellerHasDM) {
+    msgBtn.disabled = true;
+    msgBtn.title = 'Seller has no NIP-17 DM relays.';
+  }
+  msgBtn.addEventListener('click', () => {
+    cfCloseModal('listing-modal');
+    if (!activeSigner) {
+      openLogin({ pendingAction: () => openDmThreadWith(event.pubkey) });
+      return;
+    }
+    openDmThreadWith(event.pubkey);
+  });
+  sellerEl.appendChild(msgBtn);
+
   body.appendChild(sellerEl);
 
   container.appendChild(body);
@@ -646,7 +792,8 @@ function escapeHtml(s) {
 // ============================================================
 // Login flow
 // ============================================================
-function openLogin() {
+function openLogin(opts = {}) {
+  if (opts.pendingAction) pendingPostLoginAction = opts.pendingAction;
   cfOpenModal('login-modal');
   // NIP-07 button: disable if no extension
   const nip07Btn = document.getElementById('login-nip07');
@@ -656,6 +803,17 @@ function openLogin() {
   }
   // Clear any open panels
   document.querySelectorAll('.login-panel').forEach(p => p.classList.remove('open'));
+}
+
+// Runs and clears the pending action set by openLogin({ pendingAction }).
+// Returns true if an action ran; callers use this to skip their default
+// post-login UI (e.g. openComposer).
+function runPendingPostLoginAction() {
+  if (!pendingPostLoginAction) return false;
+  const action = pendingPostLoginAction;
+  pendingPostLoginAction = null;
+  try { action(); } catch (err) { console.error('[classifieds] pending action failed', err); }
+  return true;
 }
 
 function handleLoginChoice(method) {
@@ -688,6 +846,7 @@ async function loginWithNip07() {
       pubkey,
       kind: 'nip07',
       signEvent: async (event) => await window.nostr.signEvent(event),
+      ...nip44ForNip07(),
     };
     saveSession({ kind: 'nip07', pubkey });
     onLogin();
@@ -724,6 +883,7 @@ async function loginWithBunker() {
       kind: 'nip46',
       signEvent: async (event) => await signer.signEvent(event),
       close: () => signer.close?.(),
+      ...nip44ForBunker(signer),
     };
     saveSession({
       kind: 'nip46',
@@ -756,6 +916,7 @@ async function loginWithNsec() {
       pubkey,
       kind: 'nsec',
       signEvent: async (event) => finalizeEvent(event, secretKey),
+      ...nip44ForNsec(secretKey),
     };
     saveSession({ kind: 'nsec', nsec: val });
     // Best-effort: clear the input
@@ -767,14 +928,17 @@ async function loginWithNsec() {
   }
 }
 
-function onLogin() {
+async function onLogin() {
   cfCloseModal('login-modal');
   renderUserChip();
   // Fetch the user's own profile so the chip displays nicely
   if (!profiles.has(activeSigner.pubkey)) {
     fetchProfiles([activeSigner.pubkey]);
   }
-  openComposer();
+  // Await so the DM panel is fully active before any pending action runs
+  // (e.g. openDmThreadWith from a "Message Seller" click pre-login).
+  await onSignerReady();
+  if (!runPendingPostLoginAction()) openComposer();
 }
 
 function renderUserChip() {
@@ -822,14 +986,276 @@ function logout() {
   try { activeSigner?.close?.(); } catch {}
   activeSigner = null;
   clearSavedSession();
+  deactivateDmPanel();
+  userDmRelays = null;
+  userFollowSet.clear();
+  refreshDmBanner();
   const actions = document.getElementById('cf-toolbar-actions');
   actions.innerHTML = '';
-  const btn = document.createElement('button');
-  btn.className = 'btn btn-orange';
-  btn.id = 'cf-post-btn';
-  btn.textContent = 'Post a Listing';
-  btn.addEventListener('click', () => openLogin());
-  actions.appendChild(btn);
+
+  const signInBtn = document.createElement('button');
+  signInBtn.className = 'btn btn-ghost';
+  signInBtn.id = 'cf-signin-btn';
+  signInBtn.textContent = 'Sign In';
+  signInBtn.addEventListener('click', () => {
+    openLogin({ pendingAction: () => openDmPanel() });
+  });
+  actions.appendChild(signInBtn);
+
+  const postBtn = document.createElement('button');
+  postBtn.className = 'btn btn-orange';
+  postBtn.id = 'cf-post-btn';
+  postBtn.textContent = 'Post a Listing';
+  postBtn.addEventListener('click', () => openLogin());
+  actions.appendChild(postBtn);
+}
+
+// ============================================================
+// DM wiring: 10050 gate, banners, panel context
+// ============================================================
+function userHasDMRelays() {
+  return Array.isArray(userDmRelays) && userDmRelays.length > 0;
+}
+
+// Called once after activeSigner is set (login, session restore, signup).
+// Fetches the user's own 10050 + kind 3 in parallel, then refreshes
+// banners and activates the DM panel.
+async function onSignerReady() {
+  if (!activeSigner) return;
+
+  await Promise.all([
+    userDmRelays === null ? fetchOwnDmRelays() : Promise.resolve(),
+    userFollowSet.size === 0 ? fetchOwnFollowSet() : Promise.resolve(),
+  ]);
+
+  refreshDmBanner();
+  await activateDmPanel(buildDmPanelCtx());
+}
+
+function buildDmPanelCtx() {
+  return {
+    pool,
+    signer: activeSigner,
+    profiles,
+    fetchProfiles,
+    ownDmRelays: userDmRelays || [],
+    getDmRelaysFor: (pubkey) => {
+      if (!dmRelaysByPubkey.has(pubkey)) ensureDMRelaysFor(pubkey);
+      return dmRelaysByPubkey.get(pubkey) || [];
+    },
+    isApproved: (peerPubkey) => {
+      if (peerPubkey === activeSigner?.pubkey) return true;
+      if (whitelistHex.includes(peerPubkey)) return true;
+      if (userFollowSet.has(peerPubkey)) return true;
+      return false;
+    },
+    getOnboardingState: () => {
+      if (userHasDMRelays()) return null;
+      const recommended = config.dmRecommendedRelays || ['wss://relay.primal.net', 'wss://relay.0xchat.com'];
+      return {
+        needsOnboarding: true,
+        relays: recommended,
+        publish: () => publishUserDMRelays(recommended),
+      };
+    },
+    onSentMessageTo: () => { /* panel caches its own sentTo */ },
+    onUnreadCountChange: () => {},
+  };
+}
+
+// Fetch the current user's kind 10050. Sets userDmRelays to a string[]
+// (possibly empty) so userHasDMRelays() returns a definitive answer.
+function fetchOwnDmRelays() {
+  return new Promise((resolve) => {
+    let latest = null;
+    const sub = pool.subscribeMany(
+      config.relays,
+      [{ kinds: [10050], authors: [activeSigner.pubkey], limit: 1 }],
+      {
+        onevent(event) {
+          if (!latest || event.created_at > latest.created_at) latest = event;
+        },
+        oneose() {
+          sub.close();
+          userDmRelays = latest
+            ? latest.tags.filter(t => t[0] === 'relay' && /^wss?:\/\//.test(t[1] || '')).map(t => t[1])
+            : [];
+          resolve();
+        }
+      }
+    );
+    setTimeout(() => {
+      sub.close();
+      if (userDmRelays === null) userDmRelays = latest
+        ? latest.tags.filter(t => t[0] === 'relay' && /^wss?:\/\//.test(t[1] || '')).map(t => t[1])
+        : [];
+      resolve();
+    }, 5000);
+  });
+}
+
+// Fetch the current user's kind 3 (own follows). Used as the WoT input
+// for Primary/Requests partitioning in the DM panel.
+function fetchOwnFollowSet() {
+  return new Promise((resolve) => {
+    let latest = null;
+    const sub = pool.subscribeMany(
+      config.relays,
+      [{ kinds: [3], authors: [activeSigner.pubkey], limit: 1 }],
+      {
+        onevent(event) {
+          if (!latest || event.created_at > latest.created_at) latest = event;
+        },
+        oneose() {
+          sub.close();
+          if (latest) {
+            latest.tags
+              .filter(t => t[0] === 'p' && /^[0-9a-f]{64}$/.test(t[1] || ''))
+              .forEach(t => userFollowSet.add(t[1]));
+          }
+          resolve();
+        }
+      }
+    );
+    setTimeout(() => {
+      sub.close();
+      if (latest) {
+        latest.tags
+          .filter(t => t[0] === 'p' && /^[0-9a-f]{64}$/.test(t[1] || ''))
+          .forEach(t => userFollowSet.add(t[1]));
+      }
+      resolve();
+    }, 5000);
+  });
+}
+
+// Fetch kind 10050 for every whitelisted seller, in parallel. Listings
+// whose authors don't have a 10050 are hidden — Reed's call: NIP-17 or
+// nothing. After EOSE, any whitelist member without a 10050 is marked
+// as definitively negative so we can stop withholding their listings.
+function fetchWhitelistDMRelays() {
+  if (!whitelistHex.length) return;
+
+  const sub = pool.subscribeMany(
+    config.relays,
+    [{ kinds: [10050], authors: whitelistHex }],
+    {
+      onevent(event) {
+        const prevTs = dmRelaysMeta.get(event.pubkey) || 0;
+        if (event.created_at <= prevTs) return;
+        dmRelaysMeta.set(event.pubkey, event.created_at);
+        const relays = event.tags
+          .filter(t => t[0] === 'relay' && /^wss?:\/\//.test(t[1] || ''))
+          .map(t => t[1]);
+        dmRelaysByPubkey.set(event.pubkey, relays);
+        renderGrid();
+      },
+      oneose() {
+        for (const pk of whitelistHex) {
+          if (!dmRelaysByPubkey.has(pk)) dmRelaysByPubkey.set(pk, []);
+        }
+        dmRelaysWhitelistFetched = true;
+        renderGrid();
+        sub.close();
+      }
+    }
+  );
+  // Safety net — if EOSE never arrives, settle after 10s
+  setTimeout(() => {
+    if (dmRelaysWhitelistFetched) return;
+    for (const pk of whitelistHex) {
+      if (!dmRelaysByPubkey.has(pk)) dmRelaysByPubkey.set(pk, []);
+    }
+    dmRelaysWhitelistFetched = true;
+    renderGrid();
+    try { sub.close(); } catch {}
+  }, 10000);
+}
+
+// Fetch kind 10050 for a single non-whitelist pubkey (e.g. a DM peer
+// we discovered via inbox). Returns nothing — the result lands in
+// dmRelaysByPubkey and any open panel re-reads on next render.
+const inflightDMRelayFetches = new Set();
+function ensureDMRelaysFor(pubkey) {
+  if (dmRelaysByPubkey.has(pubkey)) return;
+  if (inflightDMRelayFetches.has(pubkey)) return;
+  inflightDMRelayFetches.add(pubkey);
+
+  let latest = null;
+  const finalize = () => {
+    inflightDMRelayFetches.delete(pubkey);
+    const relays = latest
+      ? latest.tags.filter(t => t[0] === 'relay' && /^wss?:\/\//.test(t[1] || '')).map(t => t[1])
+      : [];
+    dmRelaysByPubkey.set(pubkey, relays);
+  };
+  const sub = pool.subscribeMany(
+    config.relays,
+    [{ kinds: [10050], authors: [pubkey], limit: 1 }],
+    {
+      onevent(event) {
+        if (!latest || event.created_at > latest.created_at) latest = event;
+      },
+      oneose() { sub.close(); finalize(); }
+    }
+  );
+  setTimeout(() => { try { sub.close(); } catch {} finalize(); }, 5000);
+}
+
+// One-click: publish a kind 10050 with recommended DM relays.
+async function publishUserDMRelays(relays) {
+  if (!activeSigner) throw new Error('Not signed in.');
+  if (!relays || !relays.length) throw new Error('No relays to publish.');
+
+  const event = await activeSigner.signEvent({
+    kind: 10050,
+    created_at: Math.floor(Date.now() / 1000),
+    content: '',
+    tags: [
+      ...relays.map(r => ['relay', r]),
+      ['client', 'westernmassbitcoin'],
+    ],
+  });
+
+  await publishOrThrow(config.relays, event);
+
+  userDmRelays = [...relays];
+  refreshDmBanner();
+  // Re-activate panel so the inbox subscription picks up the new relays
+  deactivateDmPanel();
+  await activateDmPanel(buildDmPanelCtx());
+  refreshDmPanelOnboarding();
+}
+
+// Persistent banner just below the toolbar — shown when a signed-in
+// user has no kind 10050.
+function refreshDmBanner() {
+  const banner = document.getElementById('dm-relay-banner');
+  if (!banner) return;
+  if (!activeSigner || userHasDMRelays() || userDmRelays === null) {
+    banner.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+}
+function wireDmBanner() {
+  const banner = document.getElementById('dm-relay-banner');
+  if (!banner) return;
+  banner.querySelector('[data-dm-banner-setup]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = 'Publishing…';
+    try {
+      const relays = config.dmRecommendedRelays || [];
+      await publishUserDMRelays(relays);
+      // banner will hide itself via refreshDmBanner; reset button text in case the user reopens
+    } catch (err) {
+      alert('Could not publish DM relays: ' + (err.message || err));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Add DM relays';
+    }
+  });
 }
 
 // ============================================================
@@ -838,7 +1264,42 @@ function logout() {
 const composerImages = []; // { url, sha256 }
 
 function openComposer() {
+  renderComposerDmBanner();
   cfOpenModal('composer-modal');
+}
+
+// Composer DM banner — shown above the form when the signed-in user has
+// no kind 10050. Doesn't disable the form (the publish-time check is the
+// hard gate), but nudges them to set up DM relays so buyers can reach them.
+function renderComposerDmBanner() {
+  const slot = document.getElementById('composer-dm-banner');
+  if (!slot) return;
+  if (!activeSigner || userHasDMRelays() || userDmRelays === null) {
+    slot.hidden = true;
+    slot.innerHTML = '';
+    return;
+  }
+  slot.hidden = false;
+  slot.innerHTML = `
+    <strong>Add DM relays first</strong>
+    <p>Buyers reach you over Nostr DMs (NIP-17). You haven't published DM relays yet, so messages to you won't be delivered. One-click setup below.</p>
+    <button type="button" class="btn btn-orange" data-composer-dm-setup>Add DM relays</button>
+    <div class="composer-dm-status" data-composer-dm-status></div>
+  `;
+  slot.querySelector('[data-composer-dm-setup]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const status = slot.querySelector('[data-composer-dm-status]');
+    btn.disabled = true;
+    status.textContent = 'Publishing…';
+    try {
+      const relays = config.dmRecommendedRelays || [];
+      await publishUserDMRelays(relays);
+      renderComposerDmBanner(); // hide once published
+    } catch (err) {
+      status.textContent = 'Failed: ' + (err.message || err);
+      btn.disabled = false;
+    }
+  });
 }
 
 function handleImagePick(e) {
@@ -941,6 +1402,9 @@ async function publishListing(e) {
 
   if (!title) return composerStatus('Title is required.', 'error');
   if (!description) return composerStatus('Description is required.', 'error');
+  if (!userHasDMRelays()) {
+    return composerStatus('Add DM relays before publishing — buyers can\'t reach you without them. Use the "Add DM relays" button above.', 'error');
+  }
 
   const submitBtn = document.getElementById('composer-submit');
   submitBtn.disabled = true;
@@ -1263,6 +1727,7 @@ async function wizardPublishAll() {
     pubkey: signupState.pubkey,
     kind: 'nsec',
     signEvent: signupState.signEvent,
+    ...nip44ForNsec(signupState.secretKey),
   };
 
   // New accounts always get a curated read/write relay list (config.newAccountRelays).
@@ -1374,6 +1839,19 @@ async function wizardPublishAll() {
     markWizardProgress('contacts', 'failed');
   }
 
+  // We just published the user's kind 10050 + kind 3, so seed module state
+  // from what we sent — onSignerReady will still re-fetch in the background
+  // to confirm, but this avoids a flash of "no DM relays" UI.
+  userDmRelays = [...userDMRelays];
+  whitelistHex.forEach(p => userFollowSet.add(p));
+  if (meetupHex) userFollowSet.add(meetupHex);
+
+  // Await so the DM panel is active before the wizard hands control back
+  // to a pending post-login action (e.g. openDmThreadWith from a pre-login
+  // Message Seller click). userDmRelays + userFollowSet are seeded above,
+  // so onSignerReady skips the network fetches and just activates the panel.
+  await onSignerReady();
+
   // Reveal final card
   const errBox = document.getElementById('wizard-error');
   if (anyFailed) {
@@ -1470,6 +1948,9 @@ function wizardFinish() {
   renderUserChip();
   // Reset wizard so re-opening starts fresh
   setTimeout(resetWizard, 400);
+  // If the user came in via a "Message Seller" or other pre-login intent,
+  // honor it now. Otherwise: end of flow — no default redirect.
+  runPendingPostLoginAction();
 }
 
 function resetWizard() {

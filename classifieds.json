@@ -27,6 +27,10 @@
     "wss://relay.primal.net",
     "wss://nos.lol"
   ],
+  "dmRecommendedRelays": [
+    "wss://relay.primal.net",
+    "wss://relay.0xchat.com"
+  ],
   "whitelistedNpubs": [
     "npub1xgyjasdztryl9sg6nfdm2wcj0j3qjs03sq7a0an32pg0lr5l6yaqxhgu7s"
   ]

@@ -73,8 +73,18 @@
           <span id="cf-status-text">Loading listings from Nostr…</span>
         </div>
         <div class="classifieds-toolbar-actions" id="cf-toolbar-actions">
+          <button class="btn btn-ghost" id="cf-signin-btn">Sign In</button>
           <button class="btn btn-orange" id="cf-post-btn">Post a Listing</button>
         </div>
+      </div>
+
+      <!-- DM relay setup banner (shown when signed-in user has no kind 10050) -->
+      <div class="dm-relay-banner" id="dm-relay-banner" hidden>
+        <div class="dm-relay-banner-text">
+          <strong>Enable Nostr DMs to use this page.</strong>
+          <span>Buyers reach sellers over NIP-17 DMs. You haven't published DM relays yet — one click gets you set up.</span>
+        </div>
+        <button type="button" class="btn btn-orange" data-dm-banner-setup>Add DM relays</button>
       </div>
     </div>
   </section>
@@ -366,6 +376,9 @@
         <h3 id="composer-modal-title">Post a Listing</h3>
       </div>
       <div class="modal-body">
+        <!-- Inline DM relay setup nudge (shown when user has no kind 10050) -->
+        <div class="composer-dm-banner" id="composer-dm-banner" hidden></div>
+
         <form id="composer-form">
 
           <div class="composer-field">
