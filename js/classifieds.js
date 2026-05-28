@@ -701,33 +701,65 @@ function openListing(event) {
   sellerEl.appendChild(sImg);
   sellerEl.appendChild(sInfo);
 
+  const isOwner = !!activeSigner && event.pubkey === activeSigner.pubkey;
+
   // Message Seller button — opens the DM panel and pre-selects the thread.
   // Disabled (with explanation) if the seller hasn't published kind 10050;
   // shouldn't normally happen because such listings are filtered out, but
-  // we render defensively in case state lags.
-  const msgBtn = document.createElement('button');
-  msgBtn.className = 'btn btn-orange listing-modal-message-btn';
-  msgBtn.type = 'button';
-  msgBtn.textContent = 'Message Seller';
-  const sellerHasDM = (dmRelaysByPubkey.get(event.pubkey) || []).length > 0;
-  if (event.pubkey === activeSigner?.pubkey) {
-    msgBtn.disabled = true;
-    msgBtn.title = "That's you.";
-  } else if (!sellerHasDM) {
-    msgBtn.disabled = true;
-    msgBtn.title = 'Seller has no NIP-17 DM relays.';
-  }
-  msgBtn.addEventListener('click', () => {
-    cfCloseModal('listing-modal');
-    if (!activeSigner) {
-      openLogin({ pendingAction: () => openDmThreadWith(event.pubkey) });
-      return;
+  // we render defensively in case state lags. Hidden for your own listing —
+  // owners get Edit/Delete controls instead.
+  if (!isOwner) {
+    const msgBtn = document.createElement('button');
+    msgBtn.className = 'btn btn-orange listing-modal-message-btn';
+    msgBtn.type = 'button';
+    msgBtn.textContent = 'Message Seller';
+    const sellerHasDM = (dmRelaysByPubkey.get(event.pubkey) || []).length > 0;
+    if (!sellerHasDM) {
+      msgBtn.disabled = true;
+      msgBtn.title = 'Seller has no NIP-17 DM relays.';
     }
-    openDmThreadWith(event.pubkey);
-  });
-  sellerEl.appendChild(msgBtn);
+    msgBtn.addEventListener('click', () => {
+      cfCloseModal('listing-modal');
+      if (!activeSigner) {
+        openLogin({ pendingAction: () => openDmThreadWith(event.pubkey) });
+        return;
+      }
+      openDmThreadWith(event.pubkey);
+    });
+    sellerEl.appendChild(msgBtn);
+  }
 
   body.appendChild(sellerEl);
+
+  // Owner controls — edit the listing or take it down after a sale.
+  if (isOwner) {
+    const owner = document.createElement('div');
+    owner.className = 'listing-modal-owner-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'btn btn-ghost';
+    editBtn.type = 'button';
+    editBtn.textContent = 'Edit listing';
+    editBtn.addEventListener('click', () => {
+      cfCloseModal('listing-modal');
+      openComposerForEdit(event);
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn listing-modal-delete-btn';
+    delBtn.type = 'button';
+    delBtn.textContent = 'Delete listing';
+
+    const delStatus = document.createElement('div');
+    delStatus.className = 'listing-modal-delete-status';
+
+    delBtn.addEventListener('click', () => deleteListing(event, delBtn, delStatus));
+
+    owner.appendChild(editBtn);
+    owner.appendChild(delBtn);
+    body.appendChild(owner);
+    body.appendChild(delStatus);
+  }
 
   container.appendChild(body);
   cfOpenModal('listing-modal');
@@ -1479,10 +1511,96 @@ function wireDmBanner() {
 // Composer
 // ============================================================
 const composerImages = []; // { url, sha256 }
+let editingEvent = null;   // when set, the composer updates this listing instead of creating a new one
 
 function openComposer() {
+  // Coming from "Post a Listing" — drop any leftover edit prefill so we start
+  // a genuinely new listing. (A fresh composer with no edit in progress keeps
+  // whatever draft the user already typed.)
+  if (editingEvent) clearComposerForm();
+  setComposerMode(null);
   renderComposerDmBanner();
   cfOpenModal('composer-modal');
+}
+
+// Toggle the composer between "post" and "edit" modes (title + submit label).
+function setComposerMode(event) {
+  editingEvent = event || null;
+  const titleEl = document.getElementById('composer-modal-title');
+  const submitBtn = document.getElementById('composer-submit');
+  if (editingEvent) {
+    titleEl.textContent = 'Edit Listing';
+    submitBtn.textContent = 'Save Changes';
+  } else {
+    titleEl.textContent = 'Post a Listing';
+    submitBtn.textContent = 'Publish to Nostr';
+  }
+}
+
+function clearComposerForm() {
+  document.getElementById('composer-form').reset();
+  composerImages.length = 0;
+  document.querySelectorAll('#composer-images .composer-image').forEach(el => el.remove());
+  hideAddButtonIfFull();
+  composerStatus('', '');
+}
+
+// Open the composer pre-filled with an existing listing's values. Saving
+// re-publishes the same addressable event (same d-tag), which replaces it.
+function openComposerForEdit(event) {
+  clearComposerForm();
+  setComposerMode(event);
+
+  document.getElementById('composer-title').value = event.tags.find(t => t[0] === 'title')?.[1] || '';
+  document.getElementById('composer-summary').value = event.tags.find(t => t[0] === 'summary')?.[1] || '';
+  document.getElementById('composer-description').value = event.content || '';
+
+  const price = event.tags.find(t => t[0] === 'price');
+  if (price) {
+    document.getElementById('composer-price-amount').value = price[1] || '';
+    const currencyEl = document.getElementById('composer-price-currency');
+    const cur = price[2] || 'SATS';
+    const normalized = /trade/i.test(cur) ? 'trade' : cur.toUpperCase();
+    if ([...currencyEl.options].some(o => o.value === normalized)) currencyEl.value = normalized;
+  }
+
+  document.getElementById('composer-tags').value =
+    event.tags.filter(t => t[0] === 't').map(t => t[1]).join(', ');
+
+  getImages(event).forEach(url => addExistingImage(url));
+
+  renderComposerDmBanner();
+  cfOpenModal('composer-modal');
+}
+
+// Add an already-hosted image (from a listing being edited) to the composer.
+// No upload — the URL is already on Blossom, so the slot is resolved on arrival.
+function addExistingImage(url) {
+  if (composerImages.length >= 4) return;
+  const slot = { url, sha256: null, pending: false };
+  composerImages.push(slot);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'composer-image';
+  const img = document.createElement('img');
+  img.src = url;
+  wrap.appendChild(img);
+  const rm = document.createElement('button');
+  rm.className = 'composer-image-remove';
+  rm.type = 'button';
+  rm.textContent = '×';
+  rm.addEventListener('click', () => {
+    const i = composerImages.indexOf(slot);
+    if (i >= 0) composerImages.splice(i, 1);
+    wrap.remove();
+    hideAddButtonIfFull();
+  });
+  wrap.appendChild(rm);
+
+  const container = document.getElementById('composer-images');
+  const addBtn = document.getElementById('composer-image-add');
+  container.insertBefore(wrap, addBtn);
+  hideAddButtonIfFull();
 }
 
 // Composer DM banner — shown above the form when the signed-in user has
@@ -1630,11 +1748,19 @@ async function publishListing(e) {
 
   try {
     const now = Math.floor(Date.now() / 1000);
-    const dTag = `wmb-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const editing = editingEvent;
+    // Editing reuses the original addressable identity (d-tag) so relays
+    // replace the listing in place, and preserves its original publish date.
+    const dTag = editing
+      ? (editing.tags.find(t => t[0] === 'd')?.[1] || `wmb-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`)
+      : `wmb-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const publishedAt = editing
+      ? (editing.tags.find(t => t[0] === 'published_at')?.[1] || String(now))
+      : String(now);
     const tags = [
       ['d', dTag],
       ['title', title],
-      ['published_at', String(now)],
+      ['published_at', publishedAt],
       ['location', 'Western Massachusetts'],
       ['client', 'westernmassbitcoin'],
     ];
@@ -1684,7 +1810,11 @@ async function publishListing(e) {
     }
 
     const quietNote = quiet ? ' (quiet mode — only on relay.mynostr.app)' : '';
-    composerStatus(`Published to ${ok}/${results.length} relay${results.length === 1 ? '' : 's'}${quietNote}. ${whitelistHex.includes(activeSigner.pubkey) ? 'Your listing will appear here shortly.' : 'Your listing is live on Nostr — email reedlabarge@gmail.com with your npub so we can add you to the meetup whitelist and it will appear here.'}`, 'success');
+    if (editing) {
+      composerStatus(`Saved to ${ok}/${results.length} relay${results.length === 1 ? '' : 's'}${quietNote}. Your changes will appear shortly.`, 'success');
+    } else {
+      composerStatus(`Published to ${ok}/${results.length} relay${results.length === 1 ? '' : 's'}${quietNote}. ${whitelistHex.includes(activeSigner.pubkey) ? 'Your listing will appear here shortly.' : 'Your listing is live on Nostr — email reedlabarge@gmail.com with your npub so we can add you to the meetup whitelist and it will appear here.'}`, 'success');
+    }
 
     // Reset form
     document.getElementById('composer-form').reset();
@@ -1696,7 +1826,9 @@ async function publishListing(e) {
     setTimeout(() => {
       cfCloseModal('composer-modal');
       composerStatus('', '');
-      // Add the new listing locally so it shows up before relay-roundtrip
+      setComposerMode(null); // back to post mode for next time
+      // Add/replace the listing locally so it shows up before relay-roundtrip.
+      // For edits the d-tag is unchanged, so this overwrites the old entry.
       if (whitelistHex.includes(event.pubkey)) {
         listings.set(`${event.pubkey}:${dTag}`, event);
         renderGrid();
@@ -1714,6 +1846,47 @@ function composerStatus(msg, kind) {
   const el = document.getElementById('composer-status');
   el.className = 'composer-status' + (msg ? ' show ' + (kind || '') : '');
   el.textContent = msg;
+}
+
+// Take a listing down. Publishes a NIP-09 (kind 5) deletion referencing both
+// the event id and its addressable coordinate, so relays/clients that honor
+// deletions drop it. The local card is removed immediately either way.
+async function deleteListing(event, btn, statusEl) {
+  if (!activeSigner || event.pubkey !== activeSigner.pubkey) return;
+  if (!confirm('Delete this listing? It will be removed from the marketplace. This can\'t be undone.')) return;
+
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Deleting…';
+  if (statusEl) { statusEl.textContent = ''; statusEl.classList.remove('error'); }
+
+  const dTag = event.tags.find(t => t[0] === 'd')?.[1] || '';
+
+  try {
+    const deletion = await activeSigner.signEvent({
+      kind: 5,
+      created_at: Math.floor(Date.now() / 1000),
+      content: 'Listing removed by seller.',
+      tags: [
+        ['e', event.id],
+        ['a', `30402:${event.pubkey}:${dTag}`],
+        ['k', '30402'],
+        ['client', 'westernmassbitcoin'],
+      ],
+    });
+    await publishOrThrow(config.relays, deletion);
+
+    listings.delete(`${event.pubkey}:${dTag}`);
+    renderGrid();
+    cfCloseModal('listing-modal');
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = original;
+    if (statusEl) {
+      statusEl.textContent = 'Could not delete: ' + (err.message || err);
+      statusEl.classList.add('error');
+    }
+  }
 }
 
 // ============================================================

@@ -2758,6 +2758,41 @@ a:hover {
 }
 
 /* ============================================================
+   Listing modal: owner controls (Edit / Delete)
+   ============================================================ */
+.listing-modal-owner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+.listing-modal-owner-actions .btn {
+  padding: 10px 20px;
+  font-size: 0.9rem;
+}
+.listing-modal-delete-btn {
+  background: rgba(255, 77, 77, 0.12);
+  color: #ff6b6b;
+  border: 1px solid rgba(255, 77, 77, 0.4);
+}
+.listing-modal-delete-btn:hover {
+  background: rgba(255, 77, 77, 0.2);
+  color: #ff6b6b;
+}
+.listing-modal-delete-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.listing-modal-delete-status {
+  margin-top: 10px;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+.listing-modal-delete-status.error {
+  color: #ff6b6b;
+}
+
+/* ============================================================
    DM floating action button
    ============================================================ */
 .dm-fab {
