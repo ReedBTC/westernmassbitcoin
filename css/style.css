@@ -3250,3 +3250,9 @@ body:has(.modal-overlay.open) .dm-fab {
     width: 100vw;
   }
 }
+
+/* Shown by js/events.js when no upcoming meetups remain */
+.events-empty {
+  color: rgba(255, 255, 255, 0.75);
+  margin: 0;
+}
